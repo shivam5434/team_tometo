@@ -1,0 +1,59 @@
+digraph G {
+  rankdir=LR; splines=true; compound=true; nodesep=0.42; ranksep=1.15; pad=0.4; bgcolor="white";
+  fontname="Liberation Sans";
+  node [shape=box, style="rounded,filled", fontname="Liberation Sans", fontsize=13, margin="0.22,0.14", penwidth=1.6, color="#2b2f36", fillcolor="#ffffff"];
+  edge [fontname="Liberation Sans", fontsize=11, color="#4b5563", fontcolor="#374151", penwidth=1.5, arrowsize=0.8];
+
+  // outside AWS
+  Browser [label=<<b>Visitor's browser</b><br/><font point-size="11" color="#4b5563">advisor chat · map · heatmap · alerts form</font>>, fillcolor="#eef2ff", color="#4f46e5"];
+  Inbox   [label=<<b>Visitor's inbox</b><br/><font point-size="11" color="#4b5563">AQI alert emails</font>>, fillcolor="#eef2ff", color="#4f46e5"];
+  OpenMeteo [label=<<b>Open-Meteo</b><br/><font point-size="11" color="#4b5563">Copernicus CAMS air-quality model<br/>+ place search</font>>, fillcolor="#ecfdf5", color="#059669"];
+  Groq    [label=<<b>Groq API</b><br/><font point-size="11" color="#4b5563">open-weight LLM (gpt-oss-120b)</font>>, fillcolor="#fff7ed", color="#c2410c"];
+  Tiles   [label=<<b>OpenStreetMap · NASA GIBS</b><br/><font point-size="11" color="#4b5563">map tiles and night-lights imagery</font>>, fillcolor="#f3f4f6", color="#6b7280"];
+  Owner   [label=<<b>Your email</b><br/><font point-size="11" color="#4b5563">ops alarms</font>>, fillcolor="#eef2ff", color="#4f46e5"];
+
+  subgraph cluster_aws {
+    label=<<b>AWS Cloud · us-east-1 · deployed with one AWS SAM template</b>>; labeljust=l; fontsize=14;
+    style="rounded,dashed"; color="#ff9900"; penwidth=2; margin=24;
+
+    subgraph cluster_ingest { label=<<font point-size="12" color="#6b7280">Data refresh (every 3 hours)</font>>; style="rounded"; color="#e5e7eb"; margin=14;
+      EventBridge [label=<<b>Amazon EventBridge</b><br/><font point-size="11" color="#4b5563">schedule rule</font>>, fillcolor="#fce7f3", color="#be185d"];
+      Ingest [label=<<b>AWS Lambda</b><br/>ingest<br/><font point-size="11" color="#4b5563">412 cities · CPCB AQI scoring<br/>then checks alerts</font>>, fillcolor="#ffedd5", color="#ea580c"];
+    }
+    subgraph cluster_data { label=<<font point-size="12" color="#6b7280">Data</font>>; style="rounded"; color="#e5e7eb"; margin=14;
+      DynamoDB [label=<<b>Amazon DynamoDB</b><br/><font point-size="11" color="#4b5563">latest readings (TTL) · alerts<br/>· daily call caps</font>>, fillcolor="#dcfce7", color="#15803d"];
+      S3 [label=<<b>Amazon S3</b><br/><font point-size="11" color="#4b5563">snapshot for the map</font>>, fillcolor="#dcfce7", color="#15803d"];
+    }
+    subgraph cluster_serve { label=<<font point-size="12" color="#6b7280">Website, API and AI advisor</font>>; style="rounded"; color="#e5e7eb"; margin=14;
+      ApiGW [label=<<b>Amazon API Gateway</b><br/><font point-size="11" color="#4b5563">HTTP API</font>>, fillcolor="#fce7f3", color="#be185d"];
+      ApiLambda [label=<<b>AWS Lambda</b><br/>site + API + AI advisor<br/><font point-size="11" color="#4b5563">Strands Agents · 5 tools<br/>rules-engine fallback</font>>, fillcolor="#ffedd5", color="#ea580c"];
+      SSM [label=<<b>Systems Manager<br/>Parameter Store</b><br/><font point-size="11" color="#4b5563">LLM API key (SecureString)</font>>, fillcolor="#ede9fe", color="#6d28d9"];
+    }
+    SNS [label=<<b>Amazon SNS</b><br/><font point-size="11" color="#4b5563">email alerts<br/>one filtered subscription each</font>>, fillcolor="#fce7f3", color="#be185d"];
+    subgraph cluster_ops { label=<<font point-size="12" color="#6b7280">Monitoring and cost guard</font>>; style="rounded"; color="#e5e7eb"; margin=14;
+      CW [label=<<b>Amazon CloudWatch</b><br/><font point-size="11" color="#4b5563">5 alarms on both Lambdas and the bill:<br/>errors · refresh stopped · traffic spike</font>>, fillcolor="#ede9fe", color="#6d28d9"];
+      OpsSNS [label=<<b>Amazon SNS</b><br/><font point-size="11" color="#4b5563">ops topic</font>>, fillcolor="#fce7f3", color="#be185d"];
+    }
+  }
+
+  // visitor path
+  Browser -> ApiGW [label="site · /stations · /lookup\n/series · /alert · /chat"];
+  ApiGW -> ApiLambda;
+  ApiLambda -> DynamoDB [label="read", lhead=cluster_data];
+  ApiLambda -> OpenMeteo [label="live place lookup,\n48 h series"];
+  ApiLambda -> Groq [label="agent calls the model\n(tools return real data)"];
+  ApiLambda -> SSM [label="get key", style=dashed];
+  ApiLambda -> SNS [label="create alert", style=dashed];
+  Browser -> OpenMeteo [label="heatmap grid, fetched directly\n(nothing stored)", style=dashed, color="#059669", fontcolor="#047857"];
+  Browser -> Tiles [style=dashed, color="#6b7280"];
+
+  // refresh path
+  EventBridge -> Ingest;
+  Ingest -> OpenMeteo [label="fetch all cities"];
+  Ingest -> S3 [label="write", lhead=cluster_data];
+  Ingest -> SNS [label="send alerts", style=dashed];
+  SNS -> Inbox;
+
+  // monitoring
+  CW -> OpsSNS; OpsSNS -> Owner;
+}
