@@ -262,4 +262,35 @@ strands_engine._KEY_CACHE.clear()
 d = mk(); d.llm_base_url, d.llm_model, d.ssm = "https://x", "m", BadSSM()
 s, r = chat(d, "Is it okay to run now?", KGP)
 assert r["engine"] == "rules" and r.get("fallback_reason"), r
+# --- POST /alert (the page's Alerts dialog) ---
+import api                                             # noqa: E402
+
+
+def post_alert(d, body, raw=None):
+    ev = {"rawPath": "/alert", "requestContext": {"http": {"method": "POST"}}, "body": raw if raw is not None else json.dumps(body)}
+    r = api.handle(ev, d, NOW)
+    return r["statusCode"], json.loads(r["body"])
+
+
+good = {"email": "me@example.com", "place": {"name": "Kharagpur <b>", "lat": 22.33, "lon": 87.32}, "kind": "above", "threshold": 150}
+sns = SNS(); d = mk(sns=sns)
+st, r = post_alert(d, good)
+assert st == 200 and r["ok"] and r["kind"] == "above" and r["threshold"] == 150, (st, r)
+assert len(sns.subs) == 1 and sns.subs[0]["Endpoint"] == "me@example.com"
+saved = [i for k, i in d.table.items.items() if k.startswith("alert#")][0]
+assert saved["name"] == "Kharagpur b" and "<" not in saved["name"], saved["name"]      # name is cleaned
+assert post_alert(mk(sns=SNS()), dict(good, email="nope"))[0] == 400
+assert post_alert(mk(sns=SNS()), dict(good, kind="sideways"))[0] == 400
+assert post_alert(mk(sns=SNS()), dict(good, threshold=5))[0] == 400
+assert post_alert(mk(sns=SNS()), dict(good, place={"name": "Paris", "lat": 48.8, "lon": 2.3}))[0] == 400
+assert post_alert(mk(sns=SNS()), dict(good, place={"name": "x", "lat": "abc", "lon": 1}))[0] == 400
+assert post_alert(mk(sns=SNS()), {"email": "a@b.com"})[0] == 400                          # no place
+assert post_alert(mk(sns=SNS()), None, raw="not json")[0] == 400
+assert post_alert(mk(sns=SNS()), None, raw="x" * 7000)[0] == 413
+assert post_alert(mk(), good)[0] == 400                                                  # alerts not switched on
+d = mk(sns=SNS())
+for i in range(3):
+    assert post_alert(d, dict(good, threshold=100 + i))[0] == 200
+st, r = post_alert(d, good)
+assert st == 400 and "limit" in r["error"], r                                            # 3 per address
 print("test_advisor: all passed")

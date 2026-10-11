@@ -5,6 +5,7 @@
   GET /series?lat=..&lon=..
                  -> hourly pollutants for the past 48 h and next 48 h (model data),
                     plus a CPCB-style 24-hour-average AQI. Cached in DynamoDB.
+  POST /alert    -> create an email alert directly (same rules as the advisor's create_alert)
   POST /chat     -> the AI advisor (see advisor.py). Body: {"messages": [...], "context": {...}}
   GET /lookup?lat=..&lon=..[&name=..]
                  -> air quality for any place in India. Served from DynamoDB if
@@ -105,12 +106,40 @@ def _chat(event, deps, now):
     return _json(status, payload)
 
 
+def _alert(event, deps, now):
+    """POST /alert  {"email", "place": {"name","lat","lon"}, "kind", "threshold"} -> alerts.create_alert."""
+    import alerts
+    raw = event.get("body") or ""
+    if event.get("isBase64Encoded"):
+        import base64
+        raw = base64.b64decode(raw).decode("utf-8", "replace")
+    if len(raw.encode("utf-8")) > MAX_BODY:
+        return _json(413, {"error": "That request is too long."})
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        body = None
+    place = body.get("place") if isinstance(body, dict) else None
+    if not isinstance(body, dict) or not isinstance(place, dict):
+        return _json(400, {"error": "Send JSON like {\"email\", \"place\", \"kind\", \"threshold\"}."})
+    try:
+        lat, lon = float(place.get("lat")), float(place.get("lon"))
+    except (TypeError, ValueError):
+        return _json(400, {"error": "I need a place in India for the alert."})
+    res = alerts.create_alert(deps, now, body.get("email"),
+                              {"name": clean_name(place.get("name")) or "your place", "lat": lat, "lon": lon},
+                              body.get("kind"), body.get("threshold"))
+    return _json(200 if res.get("ok") else 400, res)
+
+
 def handle(event, deps, now=None):
     now = now or datetime.now(timezone.utc)
     http = (event.get("requestContext") or {}).get("http") or {}
     method, path = http.get("method", "GET"), event.get("rawPath", "/")
     if method == "POST" and path == "/chat":
         return _chat(event, deps, now)
+    if method == "POST" and path == "/alert":
+        return _alert(event, deps, now)
     if method != "GET":
         return _json(405, {"error": "method not allowed"})
     if path == "/":

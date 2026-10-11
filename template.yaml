@@ -174,6 +174,12 @@ Resources:
             ApiId: !Ref AirApi
             Path: /chat
             Method: POST
+        Alert:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref AirApi
+            Path: /alert
+            Method: POST
 
 Outputs:
   TableName:
