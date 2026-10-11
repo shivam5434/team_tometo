@@ -39,6 +39,21 @@ Parameters:
     Type: String
     Default: ""
     Description: Region to call Bedrock in. Empty = this stack's region.
+  OpsEmail:
+    Type: String
+    Default: ""
+    Description: Your own email for CloudWatch alarm notifications (errors, ingest stopped, traffic spike, bill). Empty = alarms still exist but nobody is emailed. AWS sends a confirmation link you must click once.
+  ApiInvocationsPerHour:
+    Type: Number
+    Default: 3000
+    Description: Cost guard. Alarm if the API function is invoked more than this many times in one hour (normal use is a small fraction of this).
+  BillingLimitUsd:
+    Type: Number
+    Default: 5
+    Description: Alarm when the account's estimated charges for the month pass this many US dollars. Needs "Receive Billing Alerts" switched on in the AWS Billing preferences, and only works in us-east-1.
+
+Conditions:
+  HasOpsEmail: !Not [!Equals [!Ref OpsEmail, ""]]
 
 Resources:
   AlertTopic:
@@ -181,6 +196,105 @@ Resources:
             Path: /alert
             Method: POST
 
+  # ---- CloudWatch alarms: they email YOU (OpsTopic), separate from the visitors' AlertTopic ----
+  OpsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: India Air Advisor ops
+
+  OpsEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasOpsEmail
+    Properties:
+      TopicArn: !Ref OpsTopic
+      Protocol: email
+      Endpoint: !Ref OpsEmail
+
+  ApiErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The API/chat Lambda is failing (3 or more errors in 5 minutes). Check its CloudWatch logs.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  IngestErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The 3-hourly data refresh failed. The map will go stale.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 10800
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  IngestStoppedAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: The data refresh has not run at all for 6 hours (it should run every 3). Check the EventBridge schedule.
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref OpsTopic]
+
+  TrafficSpikeAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Cost guard. The API was invoked far more often than normal in one hour (a crawler, a loop, or a viral link).
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ApiFunction
+      Statistic: Sum
+      Period: 3600
+      EvaluationPeriods: 1
+      Threshold: !Ref ApiInvocationsPerHour
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
+  BillAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmDescription: Cost guard. Estimated AWS charges for this month passed the limit. (Needs billing alerts switched on in Billing preferences.)
+      Namespace: AWS/Billing
+      MetricName: EstimatedCharges
+      Dimensions:
+        - Name: Currency
+          Value: USD
+      Statistic: Maximum
+      Period: 21600
+      EvaluationPeriods: 1
+      Threshold: !Ref BillingLimitUsd
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref OpsTopic]
+
 Outputs:
   TableName:
     Value: !Ref AirTable
@@ -195,3 +309,5 @@ Outputs:
   AppUrl:
     Description: Open this in a browser - the map page and the API share this URL
     Value: !Sub "https://${AirApi}.execute-api.${AWS::Region}.amazonaws.com/"
+  OpsTopicArn:
+    Value: !Ref OpsTopic
