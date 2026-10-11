@@ -105,6 +105,18 @@ nav.layers .sep{width:1px;height:20px;background:var(--glass-line);flex:none;mar
 .legend-note{margin:-4px 2px 10px;font-size:11.5px;color:var(--muted)}
 #map.night .leaflet-tile-pane{filter:none}
 
+/* ---- heatmap mode ---- */
+.seg{display:flex;gap:2px;padding:3px;border-radius:999px;background:var(--glass-in);border:1px solid var(--glass-line);flex:none}
+.seg button{border:0;background:transparent;padding:5px 13px;border-radius:999px;font-size:13px;color:var(--ink)}
+.seg button[aria-pressed="true"]{background:var(--accent);color:#fff}
+[data-theme="dark"] .seg button[aria-pressed="true"]{color:#0b1a12}
+.heatpill{display:flex;align-items:center;gap:8px;flex-wrap:wrap;max-width:min(420px,calc(100vw - 32px));padding:7px 12px;font-size:12.5px;color:var(--ink);
+  background:var(--glass);border:1px solid var(--glass-line);border-radius:16px;box-shadow:var(--glass-shadow);
+  -webkit-backdrop-filter:var(--blur);backdrop-filter:var(--blur)}
+.heatpill[hidden]{display:none}
+.heatpill .hr{color:var(--muted)}
+.heatpill button{padding:2px 9px;font-size:12px;border-radius:999px;background:var(--glass-in);border:1px solid var(--glass-line);color:var(--ink)}
+.heat-img{filter:blur(1.5px);image-rendering:auto;pointer-events:none}
 /* ---- AI advisor chat ---- */
 #chat{margin:12px 0;padding:12px;border-radius:20px;background:var(--glass-in)}
 #chat h3{margin:0 0 2px;font-size:15px}
@@ -129,6 +141,8 @@ nav.layers .sep{width:1px;height:20px;background:var(--glass-line);flex:none;mar
   header{position:sticky;top:8px;left:auto;right:auto;margin:8px 8px 0;flex-wrap:wrap;z-index:1100}
   h1{order:1;flex:1}
   #theme{order:3}
+  .seg{order:5;flex:1 1 100%}
+  .seg button{flex:1}
   details.about{order:2}
   form.search{order:4;flex:1 1 100%;max-width:none;margin:0}
   #map{position:relative;inset:auto;height:58vh;min-height:320px;margin:8px 8px 0;border-radius:24px;overflow:hidden}
@@ -215,6 +229,10 @@ details.fold[open]>summary{margin-bottom:8px}
 <body>
 <header>
   <h1>India Air Advisor<small>Estimated air quality for any place in India, on the CPCB AQI scale</small></h1>
+  <div class="seg" role="group" aria-label="Map mode">
+    <button type="button" id="modeMap" aria-pressed="true" title="Markers for each city">Map</button>
+    <button type="button" id="modeHeat" aria-pressed="false" title="Continuous colour field for the layer chosen below">Heatmap</button>
+  </div>
   <form class="search" id="searchForm" role="search" autocomplete="off">
     <label class="sr" for="q">Search for a place in India</label>
     <input id="q" type="search" placeholder="Search a town or city in India" aria-controls="results">
@@ -227,6 +245,7 @@ details.fold[open]>summary{margin-bottom:8px}
     <div class="pop">
       <p>Estimated air quality for any place in India on the CPCB AQI scale. These are estimates from a regional air-quality model (about 45&nbsp;km resolution), not readings from a sensor near you, and can differ from official CPCB or station-network numbers.</p>
       <p>AQI = the highest CPCB sub-index among PM2.5, PM10, NO₂, SO₂, O₃ and CO. Markers use the latest model values; CPCB itself uses 24-hour averages (8-hour for O₃ and CO), shown separately on each place. General information, not medical advice.</p>
+      <p>Heatmap mode: your browser asks Open-Meteo directly for about 360 grid points (1° apart, over land near our cities) and blends them into a smooth colour field. Nothing is stored on our server. The colours between grid points are interpolated guesses, and are cached in your browser for an hour. Open-Meteo’s free tier is for non-commercial use.</p>
       <p>City list: <a href="https://www.geonames.org/" target="_blank" rel="noopener">GeoNames</a> (CC&nbsp;BY&nbsp;4.0). Data: <a href="https://open-meteo.com/" target="_blank" rel="noopener">Open-Meteo.com</a> (CC&nbsp;BY&nbsp;4.0), based on Copernicus CAMS. Map © <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors.</p>
     </div>
   </details>
@@ -333,6 +352,7 @@ details.fold[open]>summary{margin-bottom:8px}
     document.documentElement.setAttribute("data-theme", t);
     $("theme").textContent = (t === "dark") ? "Light mode" : "Dark mode";
     if (save) { try { localStorage.setItem("air-theme", t); } catch (e) {} }
+    if (mode === "heat") heatRender();
   }
   function currentTheme() { return document.documentElement.getAttribute("data-theme") === "dark" ? "dark" : "light"; }
   applyTheme(currentTheme(), false);
@@ -350,13 +370,90 @@ details.fold[open]>summary{margin-bottom:8px}
   function syncTiers() {
     var z = map.getZoom();
     [1, 2, 3].forEach(function (t) {
-      var show = t === 1 || (t === 2 && z >= 6) || (t === 3 && z >= 7);
+      var show = mode !== "heat" && (t === 1 || (t === 2 && z >= 6) || (t === 3 && z >= 7));
       if (show && !map.hasLayer(tierLayers[t])) tierLayers[t].addTo(map);
       if (!show && map.hasLayer(tierLayers[t])) map.removeLayer(tierLayers[t]);
     });
   }
   map.on("zoomend", syncTiers);
   var pickMarker = null;
+
+  // HEAT-START
+  // Heatmap maths: pure functions (tested against the Python AQI code in tests/test_heat.py).
+  var HEAT_BANDS = {"pm25":{"b":[[0,30,0,50],[31,60,51,100],[61,90,101,200],[91,120,201,300],[121,250,301,400],[251,380,401,500]],"s":1},"pm10":{"b":[[0,50,0,50],[51,100,51,100],[101,250,101,200],[251,350,201,300],[351,430,301,400],[431,510,401,500]],"s":1},"no2":{"b":[[0,40,0,50],[41,80,51,100],[81,180,101,200],[181,280,201,300],[281,400,301,400],[401,800,401,500]],"s":1},"so2":{"b":[[0,40,0,50],[41,80,51,100],[81,380,101,200],[381,800,201,300],[801,1600,301,400],[1601,2400,401,500]],"s":1},"o3":{"b":[[0,50,0,50],[51,100,51,100],[101,168,101,200],[169,208,201,300],[209,748,301,400],[749,1000,401,500]],"s":1},"co":{"b":[[0,10,0,50],[11,20,51,100],[21,100,101,200],[101,170,201,300],[171,340,301,400],[341,500,401,500]],"s":10}};
+  var HEAT_GRID = [[8,76],[8,77],[8,78],[8,79],[9,76],[9,77],[9,78],[9,79],[10,72],[10,73],[10,75],[10,76],[10,77],[10,78],[10,79],[10,80],[11,72],[11,73],[11,75],[11,76],[11,77],[11,78],[11,79],[11,80],[11,81],[11,92],[11,93],[12,74],[12,75],[12,76],[12,77],[12,78],[12,79],[12,80],[12,81],[12,92],[12,93],[13,74],[13,75],[13,76],[13,77],[13,78],[13,79],[13,80],[13,81],[14,74],[14,75],[14,76],[14,77],[14,78],[14,79],[14,80],[14,81],[15,73],[15,74],[15,75],[15,76],[15,77],[15,78],[15,79],[15,80],[15,81],[16,73],[16,74],[16,75],[16,76],[16,77],[16,78],[16,79],[16,80],[16,81],[16,82],[17,73],[17,74],[17,75],[17,76],[17,77],[17,78],[17,79],[17,80],[17,81],[17,82],[17,83],[17,84],[18,73],[18,74],[18,75],[18,76],[18,77],[18,78],[18,79],[18,80],[18,81],[18,82],[18,83],[18,84],[18,85],[19,72],[19,73],[19,74],[19,75],[19,76],[19,77],[19,78],[19,79],[19,80],[19,81],[19,82],[19,83],[19,84],[19,85],[19,86],[20,70],[20,71],[20,72],[20,73],[20,74],[20,75],[20,76],[20,77],[20,78],[20,79],[20,80],[20,81],[20,82],[20,84],[20,85],[20,86],[20,87],[21,69],[21,70],[21,71],[21,72],[21,73],[21,74],[21,75],[21,76],[21,77],[21,78],[21,79],[21,80],[21,81],[21,82],[21,83],[21,84],[21,85],[21,86],[21,87],[21,88],[22,69],[22,70],[22,71],[22,72],[22,73],[22,74],[22,75],[22,76],[22,77],[22,78],[22,79],[22,80],[22,81],[22,82],[22,83],[22,84],[22,85],[22,86],[22,87],[22,88],[22,89],[23,69],[23,70],[23,71],[23,72],[23,73],[23,74],[23,75],[23,76],[23,77],[23,78],[23,79],[23,80],[23,81],[23,82],[23,83],[23,84],[23,85],[23,86],[23,87],[23,88],[23,89],[23,90],[23,91],[23,92],[23,93],[24,69],[24,70],[24,71],[24,72],[24,73],[24,74],[24,75],[24,76],[24,77],[24,78],[24,79],[24,80],[24,81],[24,82],[24,83],[24,84],[24,85],[24,86],[24,87],[24,88],[24,89],[24,90],[24,91],[24,92],[24,93],[24,94],[25,71],[25,72],[25,73],[25,74],[25,75],[25,76],[25,77],[25,78],[25,79],[25,80],[25,81],[25,82],[25,83],[25,84],[25,85],[25,86],[25,87],[25,88],[25,89],[25,90],[25,91],[25,92],[25,93],[25,94],[25,95],[26,71],[26,72],[26,73],[26,74],[26,75],[26,76],[26,77],[26,78],[26,79],[26,80],[26,81],[26,82],[26,83],[26,84],[26,85],[26,86],[26,87],[26,88],[26,89],[26,90],[26,91],[26,92],[26,93],[26,94],[26,95],[27,70],[27,71],[27,72],[27,73],[27,74],[27,75],[27,76],[27,77],[27,78],[27,79],[27,80],[27,81],[27,82],[27,83],[27,84],[27,85],[27,86],[27,87],[27,88],[27,89],[27,90],[27,91],[27,92],[27,93],[27,94],[27,95],[27,96],[28,71],[28,72],[28,73],[28,74],[28,75],[28,76],[28,77],[28,78],[28,79],[28,80],[28,81],[28,82],[28,84],[28,88],[28,89],[28,93],[28,94],[28,95],[28,96],[29,73],[29,74],[29,75],[29,76],[29,77],[29,78],[29,79],[29,80],[29,81],[30,73],[30,74],[30,75],[30,76],[30,77],[30,78],[30,79],[30,80],[31,74],[31,75],[31,76],[31,77],[31,78],[31,79],[32,74],[32,75],[32,76],[32,77],[32,78],[33,74],[33,75],[33,76],[33,77],[34,74],[34,75],[34,76],[34,77],[34,78],[34,79],[35,74],[35,75],[35,76],[35,77],[35,78]];   // [lat, lon] of the sampled points (land near our cities, 1 degree apart)
+  var HEAT_LAT0 = 6, HEAT_LON0 = 68, HEAT_NLAT = 32, HEAT_NLON = 30;
+  var HEAT_MAX = { pm25: 1000, pm10: 2000, no2: 2000, so2: 5000, o3: 1000, co: 100 };   // plausibility limits (CO in mg/m3)
+  var HEAT_KEYS = ["pm25", "pm10", "no2", "so2", "o3", "co", "dust", "uv"];
+  function hSub(key, conc) {
+    var d = HEAT_BANDS[key];
+    if (conc == null || conc !== conc || conc < 0) return null;
+    var c = Math.floor(conc * d.s + 0.5), b = d.b;
+    if (c > b[b.length - 1][1]) return 500;
+    for (var i = 0; i < b.length; i++) {
+      if (b[i][0] <= c && c <= b[i][1]) return Math.floor((b[i][3] - b[i][2]) / (b[i][1] - b[i][0]) * (c - b[i][0]) + b[i][2] + 0.5);
+    }
+    return null;
+  }
+  // CPCB AQI = highest sub-index. Same dust guard as the server: PM10 >= 150 and > 4x PM2.5 is ignored.
+  function heatAqi(v) {
+    var pm10 = v.pm10;
+    if (v.pm25 && v.pm10 && v.pm10 >= 150 && v.pm10 / v.pm25 > 4) pm10 = null;
+    var given = { pm25: v.pm25, pm10: pm10, no2: v.no2, so2: v.so2, o3: v.o3, co: v.co }, best = null, dom = null;
+    ["pm25", "pm10", "no2", "so2", "o3", "co"].forEach(function (k) {
+      var s = hSub(k, given[k]);
+      if (s != null && (best == null || s > best)) { best = s; dom = k; }
+    });
+    return best == null ? null : { aqi: best, dominant: dom };
+  }
+  function heatClean(key, x) {
+    if (x == null || x !== x || x < 0) return null;
+    if (HEAT_MAX[key] != null && x > HEAT_MAX[key]) return null;
+    return x;
+  }
+  // one value per grid cell for a layer; NaN where there is no data
+  function heatVals(cells, layerId) {
+    var out = new Float32Array(HEAT_NLAT * HEAT_NLON);
+    for (var i = 0; i < out.length; i++) {
+      var c = cells[i], v = NaN;
+      if (c) {
+        if (layerId === "aqi") { var r = heatAqi(c); if (r) v = r.aqi; }
+        else if (c[layerId] != null) v = c[layerId];
+      }
+      out[i] = v;
+    }
+    return out;
+  }
+  // bilinear sample; corners without data are left out and their weight is dropped. a = share of data (0..1)
+  function heatSample(vals, lat, lon) {
+    var gi = lat - HEAT_LAT0, gj = lon - HEAT_LON0;
+    if (gi < 0 || gj < 0 || gi > HEAT_NLAT - 1 || gj > HEAT_NLON - 1) return null;
+    var i0 = Math.min(Math.floor(gi), HEAT_NLAT - 2), j0 = Math.min(Math.floor(gj), HEAT_NLON - 2), fi = gi - i0, fj = gj - j0;
+    var sw = 0, sv = 0;
+    var cs = [[i0, j0, (1 - fi) * (1 - fj)], [i0, j0 + 1, (1 - fi) * fj], [i0 + 1, j0, fi * (1 - fj)], [i0 + 1, j0 + 1, fi * fj]];
+    for (var k = 0; k < 4; k++) {
+      var v = vals[cs[k][0] * HEAT_NLON + cs[k][1]];
+      if (v === v) { sw += cs[k][2]; sv += cs[k][2] * v; }
+    }
+    return sw > 0 ? { v: sv / sw, a: sw } : null;
+  }
+  // continuous colour: each band's colour sits at the middle of the band; blend in between
+  function heatColor(ups, colors, v) {
+    var n = colors.length, mids = [];
+    for (var i = 0; i < n; i++) {
+      mids.push(i === 0 ? ups[0] / 2 : (i === n - 1 ? ups[n - 2] * 1.3 : (ups[i - 1] + ups[i]) / 2));
+    }
+    if (v <= mids[0]) return colors[0];
+    if (v >= mids[n - 1]) return colors[n - 1];
+    for (var j = 1; j < n; j++) {
+      if (v <= mids[j]) {
+        var t = (v - mids[j - 1]) / (mids[j] - mids[j - 1]), a = colors[j - 1], b = colors[j];
+        return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+      }
+    }
+    return colors[n - 1];
+  }
+  // HEAT-END
 
   // ---------- map layers: colour the markers by AQI or by one pollutant ----------
   var N6 = ["good", "satisfactory", "moderate", "poor", "verypoor", "severe"];
@@ -410,7 +507,8 @@ details.fold[open]>summary{margin-bottom:8px}
     curLayer.cls.forEach(function (c, i) {
       ul.appendChild(h("li", { class: "c-" + c }, curLayer.names ? h("b", { text: curLayer.names[i] }) : null, curLayer.ranges[i]));
     });
-    $("legendNote").textContent = curLayer.title + (curLayer.unit ? " (" + curLayer.unit + ")" : "") + " · " + curLayer.note;
+    $("legendNote").textContent = curLayer.title + (curLayer.unit ? " (" + curLayer.unit + ")" : "") + " · " + curLayer.note +
+      (mode === "heat" ? " · heatmap: blended between grid points 1° apart" : "");
   }
   function renderLists() {
     if (!allStations) return;
@@ -440,6 +538,7 @@ details.fold[open]>summary{margin-bottom:8px}
     markers.forEach(function (x) { x.m.options.title = markerTitle(x.s); x.m.setIcon(iconFor(x.s)); });
     if (pickMarker && pickData) pickMarker.setIcon(iconFor(pickData, true));
     renderLists();
+    if (mode === "heat") heatRender();
   }
   LAYERS.forEach(function (x) {
     var b = h("button", { type: "button", "data-id": x.id, "aria-pressed": x.id === "aqi" ? "true" : "false", text: x.label, title: x.title });
@@ -470,6 +569,167 @@ details.fold[open]>summary{margin-bottom:8px}
     }
   });
   $("night").addEventListener("click", function () { setNight(!nightOn); });
+
+  // ---------- heatmap mode: the browser asks Open-Meteo directly; nothing is stored on our server ----------
+  var mode = "map";
+  var OM_URL = "https://air-quality-api.open-meteo.com/v1/air-quality";
+  var HEAT_CACHE_KEY = "air-heat-v1", HEAT_TTL = 60 * 60 * 1000, HEAT_CHUNK = 90, HEAT_W = 420;
+  var HEAT_BOUNDS = [[HEAT_LAT0, HEAT_LON0], [HEAT_LAT0 + HEAT_NLAT - 1, HEAT_LON0 + HEAT_NLON - 1]];
+  var heat = { cells: null, at: 0, loading: false, done: 0, total: 0, err: null, overlay: null, vals: null, hover: "" };
+  var pillEl = null, hpStatus = null, hpRead = null, hpBtn = null;
+
+  var HeatCtl = L.Control.extend({
+    onAdd: function () {
+      pillEl = h("div", { class: "heatpill", id: "heatPill", hidden: "" });
+      hpStatus = h("span", { id: "hpStatus" }); hpRead = h("span", { class: "hr", id: "hpRead" });
+      hpBtn = h("button", { type: "button", id: "hpBtn", text: "Refresh", title: "Fetch fresh values from Open-Meteo" });
+      hpBtn.addEventListener("click", function () { heatLoad(true); });
+      pillEl.appendChild(hpStatus); pillEl.appendChild(hpBtn); pillEl.appendChild(hpRead);
+      L.DomEvent.disableClickPropagation(pillEl);
+      return pillEl;
+    }
+  });
+  new HeatCtl({ position: "bottomleft" }).addTo(map);
+
+  function heatPill() {
+    if (!pillEl) return;
+    pillEl.hidden = mode !== "heat";
+    if (mode !== "heat") return;
+    var busy = heat.loading, t = heat.at ? new Date(heat.at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "";
+    hpStatus.textContent = busy ? "Loading heatmap… " + heat.done + "/" + heat.total
+      : heat.err ? heat.err
+      : heat.cells ? "Heatmap · fetched " + t : "";
+    hpBtn.hidden = busy;
+    hpBtn.textContent = (heat.err && !heat.cells) ? "Retry" : "Refresh";
+    hpRead.textContent = heat.hover;
+  }
+
+  function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
+  function hexRgb(x) {
+    var m = /^#?([0-9a-f]{3}|[0-9a-f]{6})$/i.exec(x || "");
+    if (!m) return [128, 128, 128];
+    var v = m[1].length === 3 ? m[1].replace(/./g, "$&$&") : m[1];
+    return [parseInt(v.substr(0, 2), 16), parseInt(v.substr(2, 2), 16), parseInt(v.substr(4, 2), 16)];
+  }
+  function cellFrom(c) {
+    var co = (c.carbon_monoxide == null || c.carbon_monoxide !== c.carbon_monoxide) ? null : c.carbon_monoxide / 1000;   // ug/m3 -> mg/m3
+    return { pm25: heatClean("pm25", c.pm2_5), pm10: heatClean("pm10", c.pm10), no2: heatClean("no2", c.nitrogen_dioxide),
+             so2: heatClean("so2", c.sulphur_dioxide), o3: heatClean("o3", c.ozone), co: heatClean("co", co),
+             dust: heatClean("dust", c.dust), uv: heatClean("uv", c.uv_index) };
+  }
+  function heatCacheGet() {
+    try {
+      var j = JSON.parse(localStorage.getItem(HEAT_CACHE_KEY) || "null");
+      if (!j || !j.t || Date.now() - j.t > HEAT_TTL || !Array.isArray(j.c)) return null;
+      var cells = new Array(HEAT_NLAT * HEAT_NLON);
+      j.c.forEach(function (p) { if (p && p[0] >= 0 && p[0] < cells.length) cells[p[0]] = p[1]; });
+      return { t: j.t, cells: cells };
+    } catch (e) { return null; }
+  }
+  function heatCachePut(cells, t) {
+    try {
+      var c = []; cells.forEach(function (v, i) { if (v) c.push([i, v]); });
+      localStorage.setItem(HEAT_CACHE_KEY, JSON.stringify({ t: t, c: c }));
+    } catch (e) {}
+  }
+  function heatFetchChunk(idxs, cells) {
+    var la = [], lo = [];
+    idxs.forEach(function (i) { la.push(HEAT_GRID[i][0]); lo.push(HEAT_GRID[i][1]); });
+    var url = OM_URL + "?latitude=" + la.join(",") + "&longitude=" + lo.join(",") +
+      "&current=pm10,pm2_5,carbon_monoxide,nitrogen_dioxide,sulphur_dioxide,ozone,dust,uv_index&timezone=GMT";
+    return fetch(url).then(function (r) {
+      if (r.status === 429) throw new Error("rate");
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    }).then(function (j) {
+      if (j && j.error) throw new Error(String(j.reason || "error").indexOf("limit") >= 0 ? "rate" : "api");
+      (Array.isArray(j) ? j : [j]).forEach(function (o, k) {
+        if (o && o.current && idxs[k] != null) {
+          var g = HEAT_GRID[idxs[k]];
+          cells[(g[0] - HEAT_LAT0) * HEAT_NLON + (g[1] - HEAT_LON0)] = cellFrom(o.current);
+        }
+      });
+    });
+  }
+  function heatLoad(force) {
+    if (heat.loading) return;
+    if (!force) {
+      var c = heatCacheGet();
+      if (c) { heat.cells = c.cells; heat.at = c.t; heat.err = null; heatRender(); heatPill(); return; }
+    }
+    var chunks = [], i;
+    for (i = 0; i < HEAT_GRID.length; i += HEAT_CHUNK) {
+      var part = []; for (var k = i; k < Math.min(i + HEAT_CHUNK, HEAT_GRID.length); k++) part.push(k);
+      chunks.push(part);
+    }
+    var cells = new Array(HEAT_NLAT * HEAT_NLON), next = 0, failed = 0, rate = false;
+    heat.loading = true; heat.done = 0; heat.total = chunks.length; heat.err = null; heatPill();
+    function worker() {
+      if (next >= chunks.length) return Promise.resolve();
+      var idxs = chunks[next++];
+      return heatFetchChunk(idxs, cells).catch(function (e) { failed++; if (e && e.message === "rate") rate = true; })
+        .then(function () { heat.done++; heatPill(); return worker(); });
+    }
+    return Promise.all([worker(), worker(), worker()]).then(function () {
+      heat.loading = false;
+      var got = 0; cells.forEach(function (v) { if (v) got++; });
+      if (!got) {
+        heat.err = rate ? "Open-Meteo’s free limit was reached. Try again in a few minutes." : "Couldn’t load the heatmap data. Check your connection.";
+      } else {
+        heat.cells = cells; heat.at = Date.now();
+        heat.err = failed ? "Some areas are missing; Refresh to retry." : null;
+        if (!failed) heatCachePut(cells, heat.at);
+      }
+      heatRender(); heatPill();
+    });
+  }
+  function mercY(lat) { return Math.log(Math.tan(Math.PI / 4 + lat * Math.PI / 360)); }
+  function invMerc(y) { return (2 * Math.atan(Math.exp(y)) - Math.PI / 2) * 180 / Math.PI; }
+  function heatClear() { if (heat.overlay) { map.removeLayer(heat.overlay); heat.overlay = null; } }
+  function heatRender() {
+    heatClear();
+    if (mode !== "heat" || !heat.cells) return;
+    var L0 = curLayer, vals = heatVals(heat.cells, L0.id), cols = L0.cls.map(function (c) { return hexRgb(cssVar("--c-" + c)); });
+    heat.vals = vals;
+    var yTop = mercY(HEAT_BOUNDS[1][0]), yBot = mercY(HEAT_BOUNDS[0][0]), lonSpan = HEAT_NLON - 1;
+    var W = HEAT_W, H = Math.round(W * (yTop - yBot) / (lonSpan * Math.PI / 180));
+    var cv = document.createElement("canvas"); cv.width = W; cv.height = H;
+    var ctx = cv.getContext("2d"), img = ctx.createImageData(W, H), d = img.data;
+    for (var r = 0; r < H; r++) {
+      var lat = invMerc(yTop - (r + 0.5) / H * (yTop - yBot));
+      for (var c = 0; c < W; c++) {
+        var s = heatSample(vals, lat, HEAT_LON0 + (c + 0.5) / W * lonSpan);
+        if (!s || s.a < 0.15) continue;
+        var col = heatColor(L0.ups, cols, s.v), t = Math.min(1, (s.a - 0.15) / 0.5), o = (r * W + c) * 4;
+        d[o] = col[0]; d[o + 1] = col[1]; d[o + 2] = col[2]; d[o + 3] = Math.round(255 * 0.88 * t * t * (3 - 2 * t));
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+    heat.overlay = L.imageOverlay(cv.toDataURL("image/png"), HEAT_BOUNDS, { opacity: 0.72, interactive: false, className: "heat-img", alt: "" }).addTo(map);
+  }
+  function heatHover(e) {
+    if (mode !== "heat" || !heat.vals) return;
+    var s = heatSample(heat.vals, e.latlng.lat, e.latlng.lng), txt = "";
+    if (s && s.a >= 0.3) {
+      var L0 = curLayer, k = classOf(L0, s.v), i = L0.cls.indexOf(k);
+      txt = "≈ " + fmtVal(L0, s.v) + (L0.unit ? " " + L0.unit : "") + (i >= 0 ? " · " + (L0.names ? L0.names[i] : L0.ranges[i]) : "") + " (blended)";
+    }
+    if (txt !== heat.hover) { heat.hover = txt; if (hpRead) hpRead.textContent = txt; }
+  }
+  map.on("mousemove", heatHover);
+  function setMode(m) {
+    if (m === mode) return;
+    mode = m;
+    $("modeMap").setAttribute("aria-pressed", m === "map" ? "true" : "false");
+    $("modeHeat").setAttribute("aria-pressed", m === "heat" ? "true" : "false");
+    heat.hover = "";
+    syncTiers();
+    renderLegend();
+    if (m === "heat") { heatPill(); if (heat.cells && Date.now() - heat.at < HEAT_TTL) heatRender(); else heatLoad(false); }
+    else { heatClear(); heatPill(); }
+  }
+  $("modeMap").addEventListener("click", function () { setMode("map"); });
+  $("modeHeat").addEventListener("click", function () { setMode("heat"); });
 
   function fmtTime(t) {
     if (!t) return "unknown";
