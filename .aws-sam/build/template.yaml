@@ -1,0 +1,237 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: India air advisor - ingest (EventBridge -> Lambda -> DynamoDB + S3),
+  API, AI chat (Strands Agents on Bedrock, or rules) and SNS email alerts
+Parameters:
+  PythonRuntime:
+    Type: String
+    Default: python3.14
+    AllowedValues:
+    - python3.12
+    - python3.13
+    - python3.14
+    Description: Must match the Python on your PATH when you run `sam build`.
+  ScheduleExpression:
+    Type: String
+    Default: rate(3 hours)
+  TtlHours:
+    Type: Number
+    Default: 12
+  DailyLookupCap:
+    Type: Number
+    Default: 2500
+    Description: Max live Open-Meteo calls per day from the API (map-click lookups
+      and forecast series; free tier allows 10,000 calls/day).
+  DailyChatCap:
+    Type: Number
+    Default: 250
+    Description: Max chat messages per day across all visitors (cost guard).
+  BedrockModelId:
+    Type: String
+    Default: ''
+    Description: Bedrock model or inference-profile id for the chat (for example amazon.nova-micro-v1:0).
+      Empty = rule-based advisor only.
+  LlmBaseUrl:
+    Type: String
+    Default: ''
+    Description: OpenAI-compatible API base URL for the chat model, for example https://api.groq.com/openai/v1
+      . Takes priority over Bedrock when set. The API key is read from the SSM SecureString
+      parameter /air-advisor/llm-key (create it yourself; it never goes in this template).
+  LlmModel:
+    Type: String
+    Default: ''
+    Description: Model name at that provider, for example llama-3.3-70b-versatile
+  BedrockRegion:
+    Type: String
+    Default: ''
+    Description: Region to call Bedrock in. Empty = this stack's region.
+Resources:
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName: India Air Advisor
+  AirTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+      - AttributeName: pk
+        AttributeType: S
+      KeySchema:
+      - AttributeName: pk
+        KeyType: HASH
+      TimeToLiveSpecification:
+        AttributeName: expires_at
+        Enabled: true
+  SnapshotBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: IngestFunction
+      Handler: handler.lambda_handler
+      Runtime:
+        Ref: PythonRuntime
+      Timeout: 300
+      MemorySize: 256
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: AirTable
+          BUCKET_NAME:
+            Ref: SnapshotBucket
+          TTL_HOURS:
+            Ref: TtlHours
+          ALERT_TOPIC_ARN:
+            Ref: AlertTopic
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: AirTable
+      - S3WritePolicy:
+          BucketName:
+            Ref: SnapshotBucket
+      - SNSPublishMessagePolicy:
+          TopicName:
+            Fn::GetAtt:
+            - AlertTopic
+            - TopicName
+      Events:
+        Every3Hours:
+          Type: Schedule
+          Properties:
+            Schedule:
+              Ref: ScheduleExpression
+    Metadata:
+      SamResourceId: IngestFunction
+  AirApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+        - '*'
+        AllowMethods:
+        - GET
+        - POST
+        - OPTIONS
+        AllowHeaders:
+        - Content-Type
+        MaxAge: 600
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 50
+        ThrottlingRateLimit: 25
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ApiFunction
+      Handler: api.lambda_handler
+      Runtime:
+        Ref: PythonRuntime
+      Timeout: 29
+      MemorySize: 512
+      Environment:
+        Variables:
+          TABLE_NAME:
+            Ref: AirTable
+          BUCKET_NAME:
+            Ref: SnapshotBucket
+          DAILY_LOOKUP_CAP:
+            Ref: DailyLookupCap
+          DAILY_CHAT_CAP:
+            Ref: DailyChatCap
+          BEDROCK_MODEL_ID:
+            Ref: BedrockModelId
+          BEDROCK_REGION:
+            Ref: BedrockRegion
+          ALERT_TOPIC_ARN:
+            Ref: AlertTopic
+          LLM_BASE_URL:
+            Ref: LlmBaseUrl
+          LLM_MODEL:
+            Ref: LlmModel
+      Policies:
+      - DynamoDBCrudPolicy:
+          TableName:
+            Ref: AirTable
+      - Statement:
+        - Effect: Allow
+          Action: ssm:GetParameter
+          Resource:
+            Fn::Sub: arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/air-advisor/*
+      - S3ReadPolicy:
+          BucketName:
+            Ref: SnapshotBucket
+      - Statement:
+        - Effect: Allow
+          Action: sns:Subscribe
+          Resource:
+            Ref: AlertTopic
+        - Effect: Allow
+          Action:
+          - bedrock:InvokeModel
+          - bedrock:InvokeModelWithResponseStream
+          Resource: '*'
+      Events:
+        Page:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: AirApi
+            Path: /
+            Method: GET
+        Stations:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: AirApi
+            Path: /stations
+            Method: GET
+        Series:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: AirApi
+            Path: /series
+            Method: GET
+        Lookup:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: AirApi
+            Path: /lookup
+            Method: GET
+        Chat:
+          Type: HttpApi
+          Properties:
+            ApiId:
+              Ref: AirApi
+            Path: /chat
+            Method: POST
+    Metadata:
+      SamResourceId: ApiFunction
+Outputs:
+  TableName:
+    Value:
+      Ref: AirTable
+  BucketName:
+    Value:
+      Ref: SnapshotBucket
+  IngestFunctionName:
+    Value:
+      Ref: IngestFunction
+  ApiFunctionName:
+    Value:
+      Ref: ApiFunction
+  AlertTopicArn:
+    Value:
+      Ref: AlertTopic
+  AppUrl:
+    Description: Open this in a browser - the map page and the API share this URL
+    Value:
+      Fn::Sub: https://${AirApi}.execute-api.${AWS::Region}.amazonaws.com/
